@@ -1,0 +1,24 @@
+.role {
+  display: inline-block;
+  margin: 9px 0 2px;
+  padding: 4px 7px;
+  border-left: 2px solid var(--yellow);
+  background: #122833;
+  color: #d6e6e9;
+  font: 11px 'DM Mono', monospace;
+}
+
+.org-context {
+  padding: 11px 18px 15px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.org-context b,
+.org-context span,
+.org-context small { display: block; }
+.org-context b { color: var(--yellow); font-family: 'DM Mono', monospace; }
+.org-context span { color: var(--ink); margin: 3px 0; }
+.org-context small { color: var(--muted); }
+.org-context a { color: var(--cyan); }

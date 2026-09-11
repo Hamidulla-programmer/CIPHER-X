@@ -1,0 +1,13 @@
+From: Microsoft Security <alert@micros0ft-account-security.com>
+To: analyst@example.org
+Subject: Urgent: Verify your account immediately
+Date: Thu, 10 Sep 2026 09:00:00 +0000
+Message-ID: <demo-cx@example.org>
+Authentication-Results: mx.example.org; spf=fail smtp.mailfrom=micros0ft-account-security.com; dkim=fail; dmarc=fail
+Received: from suspicious-host (suspicious-host [76.223.180.122]) by mx.example.org with ESMTP id DEMO1
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Your Microsoft account will be suspended. Verify your account immediately.
+Click here: https://micros0ft-account-security.com/login?session=123
+Enter your password to avoid service interruption.

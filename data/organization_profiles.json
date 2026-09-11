@@ -1,0 +1,14 @@
+{
+  "presidencyuniversity.in": {
+    "organization": "Presidency University",
+    "location_label": "Rajanukunte, Yelahanka, Bengaluru, Karnataka, India",
+    "country": "India",
+    "city": "Bengaluru",
+    "latitude": 12.9716,
+    "longitude": 77.5946,
+    "coordinate_precision": "city reference",
+    "source_label": "Official Presidency University contact page",
+    "source_url": "https://presidencyuniversity.in/contact-us/",
+    "verification_note": "This is a verified organisation-address profile. It is separate from the mail relay IP location."
+  }
+}
