@@ -43,7 +43,7 @@ The local classifier is a scikit-learn TF-IDF + Logistic Regression baseline and
 - **Campaign support:** searchable local cases can be grouped by recurring sender identity and risk level; the dashboard exposes campaign candidates.
 - **Privacy and evidence:** raw email is processed in memory and is not persisted by default. Stored email identities are masked by default (`CIPHERX_MASK_PERSONAL_DATA=true`). A hash-linked `custody_log` records every stored investigation.
 
-## Optional blockchain evidence anchoring
+##  blockchain evidence anchoring
 
 The local chain-of-custody ledger is not blockchain. CIPHER-X now also includes an optional Solidity contract for **Polygon Amoy testnet** or another Ethereum-compatible network. It anchors only an existing SHA-256 evidence hash and CIPHER-X case ID; it never puts raw mail, names, addresses, subject lines or credentials on-chain.
 
