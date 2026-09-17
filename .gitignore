@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .env
+.env.local
+data/cipherx_cases.sqlite3

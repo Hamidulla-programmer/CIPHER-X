@@ -1,3 +1,5 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 python-multipart==0.0.20
+scikit-learn>=1.9.1
+web3>=7.0.0

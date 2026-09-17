@@ -6,6 +6,7 @@ import json
 import ipaddress
 import re
 import uuid
+import os
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
@@ -16,8 +17,17 @@ from urllib.error import URLError
 from functools import lru_cache
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from .realtime_monitor import ImapMonitor
+from .mailbox_scanner import MailboxScanner
+from .mailbox_store import save as save_case, dashboard as mailbox_dashboard
+from .ml_engine import predict_phishing, model_status
+from .forensics import protocol_evidence, domain_intelligence, behavioral_evidence
+from .live_intelligence import authentication_intelligence
+from .blockchain import status as blockchain_status, anchor as anchor_evidence, verify as verify_anchor
+from .mailbox_store import case_hash, save_anchor, get_case, intelligence, clear_cases
 
 ROOT = Path(__file__).resolve().parent.parent
 ORGANIZATION_PROFILES = json.loads((ROOT / "data" / "organization_profiles.json").read_text(encoding="utf-8"))
@@ -181,6 +191,7 @@ def analyze(raw: bytes, filename: str) -> dict:
     domains = {domain_of(urlparse(u).hostname or "") for u in urls}
     sender = str(message.get("From", ""))
     sender_domain = email_domain(sender)
+    protocol = protocol_evidence(message, sender_domain, urls)
     if sender_domain:
         domains.add(sender_domain)
     received = message.get_all("Received", [])
@@ -194,19 +205,39 @@ def analyze(raw: bytes, filename: str) -> dict:
         evidence.append({"points": points, "title": title, "detail": detail})
 
     auth = {kind.upper(): auth_status(headers, kind) for kind in ("spf", "dkim", "dmarc")}
+    live_auth = authentication_intelligence(sender_domain, str(message.get("DKIM-Signature", "")))
     for kind, points in (("SPF", 18), ("DKIM", 14), ("DMARC", 16)):
         if auth[kind] in ("FAIL", "SOFTFAIL", "PERMERROR", "TEMPERROR"):
             add(points, f"{kind} authentication {auth[kind]}", "Receiver authentication evidence indicates a policy or signature failure.")
+    for anomaly in protocol["anomalies"]:
+        add(12, f"Identity anomaly: {anomaly['kind'].replace('_', ' ')}", anomaly["detail"])
+    for finding in protocol["link_findings"]:
+        add(7, f"Link analysis: {finding['kind']}", finding["detail"])
+    behavior = behavioral_evidence(text, sender_domain, urls)
+    for finding in behavior:
+        add(finding["points"], f"Behavioral pattern: {finding['kind'].replace('_', ' ')}", finding["detail"])
     low_text = text.lower()
+    pressure_context = any(cue in low_text for cue in ("urgent", "immediately", "click here", "suspended", "verify your account", "credential", "otp", "wire transfer"))
     for phrase, points in SUSPICIOUS_WORDS.items():
         if phrase in low_text:
-            add(points, f"Social-engineering cue: '{phrase}'", "Content contains a common phishing or BEC pressure signal.")
-    for domain in sorted(domains):
-        compact = domain.replace("-", "").replace("0", "o").replace("1", "l")
-        if any(brand in compact and domain != f"{brand}.com" for brand in BRANDS):
-            add(15, f"Possible brand lookalike: {domain}", "Domain resembles a frequently impersonated brand and needs analyst verification.")
+            if phrase in ("password", "invoice", "payment") and not pressure_context:
+                evidence.append({"points": 0, "title": f"Contextual term: '{phrase}'", "detail": "This common transactional term needs surrounding pressure or technical evidence before increasing risk."})
+            else:
+                add(points, f"Social-engineering cue: '{phrase}'", "Content contains a common phishing or BEC pressure signal.")
+    ml_analysis = predict_phishing(text)
+    if ml_analysis["phishing_probability"] >= 0.80:
+        add(10, "ML triage: high phishing likelihood", f"Local explainable ML probability: {ml_analysis['phishing_probability']:.0%}. Review this alongside technical evidence.")
+    elif ml_analysis["phishing_probability"] >= 0.50:
+        evidence.append({"points": 0, "title": "ML triage: review signal", "detail": f"Local explainable ML probability: {ml_analysis['phishing_probability']:.0%}. The baseline model alone does not increase the forensic score."})
+    domain_intel = [domain_intelligence(domain) for domain in sorted(domains)]
+    for record in domain_intel:
+        for finding in record["findings"]:
+            if finding["type"] == "brand_similarity":
+                add(12, f"Possible brand lookalike: {record['domain']}", finding["detail"])
+            elif finding["type"] == "uncommon_tld":
+                add(4, f"Uncommon phishing-abuse TLD: .{finding['tld']}", finding["detail"])
     if urls:
-        add(min(10, len(urls) * 4), "Embedded URL(s) found", "URLs are preserved as investigation indicators. This MVP does not claim a live URL-reputation verdict.")
+        evidence.append({"points": 0, "title": "Embedded URL(s) found", "detail": "URLs are preserved as investigation indicators. They do not increase risk unless a specific deceptive-link signal is observed."})
     if len(received) < 1:
         add(5, "No Received routing header", "Routing evidence is missing or stripped, reducing traceability.")
     attachments = []
@@ -237,11 +268,22 @@ def analyze(raw: bytes, filename: str) -> dict:
     return {
         "investigation_id": investigation_id, "analyzed_at": datetime.now(timezone.utc).isoformat(), "evidence_sha256": hashlib.sha256(raw).hexdigest(),
         "file": filename, "verdict": "SUSPICIOUS" if score >= 31 else "NO HIGH-RISK SIGNALS", "risk_score": score, "risk_level": risk_level(score),
-        "confidence": min(95, 45 + len(evidence) * 7), "email": {"from": sender, "to": str(message.get("To", "")), "subject": str(message.get("Subject", "")), "date": str(message.get("Date", "")), "message_id": str(message.get("Message-ID", ""))},
-        "authentication": auth, "received_chain": received, "iocs": {"urls": urls, "domains": sorted(domains), "ips": ips, "attachments": attachments}, "organization_context": organization_context(sender_domain), "intelligence_signals": intelligence_signals(text, sender_domain, domains),
+        "confidence": min(95, 45 + len(evidence) * 7), "email": {"from": sender, "to": str(message.get("To", "")), "subject": str(message.get("Subject", "")), "date": str(message.get("Date", "")), "message_id": str(message.get("Message-ID", ""))}, "ml_analysis": ml_analysis,
+        "authentication": auth, "live_authentication_intelligence": live_auth, "protocol_analysis": protocol, "behavioral_analysis": behavior, "domain_intelligence": domain_intel, "received_chain": received, "iocs": {"urls": urls, "domains": sorted(domains), "ips": ips, "attachments": attachments}, "organization_context": organization_context(sender_domain), "intelligence_signals": intelligence_signals(text, sender_domain, domains),
         "infrastructure": infrastructure, "evidence": sorted(evidence, key=lambda x: x["points"], reverse=True), "graph": {"nodes": nodes, "edges": edges},
-        "limitations": ["Authentication values are parsed from message headers; this prototype does not perform live SPF/DKIM/DMARC validation.", "GeoIP describes approximate network infrastructure from a third-party source. It does not identify the physical location of the organisation named in From, an attacker, or a person.", "Received headers describe a relay chain. CIPHER-X labels each observed hop by its position and confidence instead of treating any IP as a confirmed source."],
+        "limitations": ["CIPHER-X performs live SPF/DMARC/DKIM DNS policy lookup. Message-level SPF/DKIM/DMARC pass/fail values are receiver-provided header evidence; full cryptographic validation requires the original raw mail and a production verifier.", "GeoIP describes approximate network infrastructure from third-party IP intelligence. It does not identify the physical location of the organisation in From, an attacker, or a person.", "Received headers describe a relay chain. CIPHER-X labels each observed hop by its position and confidence instead of treating any IP as a confirmed source."],
     }
+
+
+def analyze_and_store(raw: bytes, filename: str, ingestion_source: str = "authorized_mailbox") -> dict:
+    result = analyze(raw, filename)
+    result["ingestion_source"] = ingestion_source
+    save_case(result)
+    return result
+
+
+monitor = ImapMonitor(analyze_and_store)
+mailbox_scanner = MailboxScanner(analyze, save_case)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -257,16 +299,220 @@ async def upload(file: UploadFile = File(...)):
     if len(raw) > 10 * 1024 * 1024:
         raise HTTPException(413, "Maximum upload size is 10 MB.")
     try:
-        return JSONResponse(analyze(raw, file.filename))
+        return JSONResponse(analyze_and_store(raw, file.filename, "eml_upload"))
     except Exception as exc:
         raise HTTPException(422, f"Could not parse email: {exc}")
 
 
+class PasteEmail(BaseModel):
+    content: str
+    filename: str = "pasted-email.eml"
+
+
+@app.post("/api/analyze/paste")
+def analyze_pasted_email(request: PasteEmail):
+    if not request.content.strip():
+        raise HTTPException(400, "Paste an email message or RFC 822 headers before analysis.")
+    raw = request.content.encode("utf-8", errors="replace")
+    try:
+        return JSONResponse(analyze_and_store(raw, request.filename, "pasted_message"))
+    except Exception as exc:
+        raise HTTPException(422, f"Could not parse pasted email: {exc}")
+
+
+@app.post("/api/demo/phishing")
+def run_phishing_demo():
+    """Analyze the bundled, clearly labelled test message for demonstrations."""
+    sample = ROOT / "samples" / "phishing-demo.eml"
+    if not sample.exists():
+        raise HTTPException(404, "The bundled phishing demonstration file is unavailable.")
+    result = analyze(sample.read_bytes(), sample.name)
+    result["ingestion_source"] = "bundled_test_file"
+    save_case(result)
+    return JSONResponse(result)
+
+
+@app.get("/api/monitor/status")
+def monitor_status():
+    """Safe status endpoint. It never exposes IMAP hostnames or credentials."""
+    return monitor.status()
+
+
+@app.get("/api/monitor/events")
+def monitor_events():
+    return {"events": monitor.events()}
+
+
+@app.post("/api/monitor/start")
+def start_monitor():
+    try:
+        monitor.start()
+        return monitor.status()
+    except RuntimeError as error:
+        raise HTTPException(400, str(error))
+
+
+@app.post("/api/monitor/stop")
+def stop_monitor():
+    monitor.stop()
+    return monitor.status()
+
+
+@app.get("/api/mailbox/dashboard")
+def get_mailbox_dashboard():
+    return {"scanner": mailbox_scanner.status(), "monitor": monitor.status(), "ml": model_status(), "dashboard": mailbox_dashboard()}
+
+
+@app.get("/api/investigations")
+def investigations():
+    return mailbox_dashboard()
+
+
+@app.post("/api/investigations/clear")
+def clear_investigations():
+    removed = clear_cases()
+    return {"removed_cases": removed, "message": "Local CIPHER-X investigation data cleared. Gmail messages were not changed."}
+
+
+@app.get("/api/investigations/{case_id}")
+def investigation(case_id: str):
+    item = get_case(case_id)
+    if not item:
+        raise HTTPException(404, "Investigation not found.")
+    return item
+
+
+@app.get("/api/intelligence")
+def threat_intelligence():
+    return intelligence()
+
+
+@app.get("/api/system/capabilities")
+def system_capabilities():
+    """An auditable feature inventory for demos and deployment reviews.
+
+    This route deliberately separates working evidence sources from optional
+    production integrations.  It prevents the dashboard or a report from
+    implying that an unavailable threat feed or antivirus engine ran.
+    """
+    return {
+        "implemented": [
+            "RFC 822 (.eml) parsing and Gmail IMAP mailbox scanning in read-only mode",
+            "header, Received-chain, sender/Reply-To/Return-Path and URL structure analysis",
+            "receiver-provided SPF/DKIM/DMARC result parsing plus live public DNS policy lookup",
+            "passive IP infrastructure enrichment, routing-hop labelling and IOC extraction",
+            "explainable local TF-IDF + Logistic Regression language triage",
+            "attachment hashing, executable-file flagging, evidence hashing and local chain-of-custody cases",
+            "HTML forensic report, case archive, evidence anchoring adapter and real-time IMAP polling",
+        ],
+        "optional_not_enabled": [
+            "VirusTotal, AbuseIPDB and URLhaus reputation queries require a configured API key and approved data-sharing policy.",
+            "ClamAV attachment scanning requires a locally installed and updated ClamAV service.",
+            "Full cryptographic DKIM verification and SMTP-context SPF evaluation require a production mail-authentication verifier.",
+            "DistilBERT requires a reviewed, trained model artifact; it is not represented as active by this prototype.",
+        ],
+        "data_handling": "Gmail access is IMAP read-only. Public DNS lookups contain only a sender domain; IP enrichment contains only observed public IP addresses.",
+        "model": model_status(),
+    }
+
+
+@app.post("/api/mailbox/scan")
+def scan_mailbox(limit: int = 250):
+    try:
+        mailbox_scanner.start(limit)
+        return mailbox_scanner.status()
+    except RuntimeError as error:
+        raise HTTPException(400, str(error))
+
+
+@app.get("/api/blockchain/status")
+def get_blockchain_status():
+    return blockchain_status()
+
+
+@app.post("/api/cases/{case_id}/anchor")
+def anchor_case(case_id: str):
+    evidence_hash = case_hash(case_id)
+    if not evidence_hash:
+        raise HTTPException(404, "Case not found in the local evidence index.")
+    try:
+        anchored = anchor_evidence(case_id, evidence_hash)
+        save_anchor(anchored)
+        return anchored
+    except RuntimeError as error:
+        raise HTTPException(400, str(error))
+
+
+@app.get("/api/evidence/{evidence_hash}/blockchain")
+def verify_evidence_anchor(evidence_hash: str):
+    try:
+        return verify_anchor(evidence_hash)
+    except RuntimeError as error:
+        raise HTTPException(400, str(error))
+
+
+def report_page(result: dict) -> str:
+    safe = lambda value: html.escape(str(value if value is not None else ""))
+    evidence = result.get("evidence", [])
+    rows = "".join(f"<tr><td>{safe(e.get('title'))}</td><td>{int(e.get('points', 0)):+d}</td><td>{safe(e.get('detail'))}</td></tr>" for e in evidence) or "<tr><td colspan='3'>No scored evidence was retained.</td></tr>"
+    ioc_data = result.get("iocs", {})
+    iocs = "<br>".join(safe(x) for x in ioc_data.get("urls", []) + ioc_data.get("domains", []) + ioc_data.get("ips", [])) or "None observed"
+    infra_rows = "".join(f"<tr><td>{safe(i.get('ip'))}</td><td>{safe(i.get('role'))}</td><td>{safe(i.get('country'))}</td><td>{safe(i.get('city'))}, {safe(i.get('region'))}</td><td>{safe(i.get('asn'))} / {safe(i.get('isp'))}</td></tr>" for i in result.get("infrastructure", [])) or "<tr><td colspan='5'>No public routing IP was observed.</td></tr>"
+    auth = result.get("authentication", {})
+    auth_rows = "".join(f"<tr><td>{safe(kind)}</td><td>{safe(value)}</td></tr>" for kind, value in auth.items()) or "<tr><td colspan='2'>No receiver authentication values were present.</td></tr>"
+    live_auth = result.get("live_authentication_intelligence", {})
+    policy_rows = "".join(f"<tr><td>{safe(label.replace('_', ' ').title())}</td><td>{safe(value)}</td></tr>" for label, value in live_auth.items() if label not in {"spf_records", "dmarc_records", "dkim_records"}) or "<tr><td colspan='2'>Live DNS policy lookup was unavailable.</td></tr>"
+    protocol = result.get("protocol_analysis", {})
+    protocol_rows = "".join(f"<tr><td>{safe(item.get('kind'))}</td><td>{safe(item.get('detail'))}</td></tr>" for item in protocol.get("anomalies", [])) or "<tr><td colspan='2'>No configured identity anomaly observed.</td></tr>"
+    domains = result.get("domain_intelligence", [])
+    domain_rows = "".join(f"<tr><td>{safe(record.get('domain'))}</td><td>{safe('; '.join(str(f.get('detail', '')) for f in record.get('findings', [])) or 'No configured lookalike/TLD signal')}</td></tr>" for record in domains) or "<tr><td colspan='2'>No domains observed.</td></tr>"
+    ml = result.get("ml_analysis", {})
+    cues = ", ".join(safe(cue.get("term")) for cue in ml.get("top_text_cues", [])) or "No positive text cue"
+    cue_rows = "".join(f"<tr><td>{safe(cue.get('term'))}</td><td>{safe(cue.get('contribution'))}</td><td>Relative local-model feature influence; not a standalone maliciousness finding.</td></tr>" for cue in ml.get("top_text_cues", [])) or "<tr><td colspan='3'>No positive phishing-language feature was extracted.</td></tr>"
+    attachment_rows = "".join(f"<tr><td>{safe(item.get('name'))}</td><td>{safe(item.get('content_type'))}</td><td>{safe(item.get('size'))}</td><td>{safe(item.get('sha256'))}</td></tr>" for item in ioc_data.get("attachments", [])) or "<tr><td colspan='4'>No attachment observed.</td></tr>"
+    header_data = protocol.get("headers", {})
+    header_rows = "".join(f"<tr><td>{safe(label)}</td><td>{safe(value)}</td></tr>" for label, value in (
+        ("From", result.get("email", {}).get("from")), ("To", result.get("email", {}).get("to")), ("Subject", result.get("email", {}).get("subject")),
+        ("Date", result.get("email", {}).get("date")), ("Message-ID", header_data.get("message_id")), ("Reply-To", header_data.get("reply_to")),
+        ("Return-Path", header_data.get("return_path")), ("Received header count", header_data.get("received_hops")), ("DKIM-Signature present", header_data.get("dkim_signature_present")),
+    ))
+    received_rows = "".join(f"<tr><td>{index + 1}</td><td>{safe(value)}</td></tr>" for index, value in enumerate(result.get("received_chain", []))) or "<tr><td colspan='2'>No Received routing header was available.</td></tr>"
+    behavior_rows = "".join(f"<tr><td>{safe(item.get('kind', '').replace('_', ' ').title())}</td><td>+{safe(item.get('points'))}</td><td>{safe(item.get('detail'))}</td></tr>" for item in result.get("behavioral_analysis", [])) or "<tr><td colspan='3'>No concrete credential-harvesting or BEC combination was observed.</td></tr>"
+    email_addresses = [result.get("email", {}).get("from"), result.get("email", {}).get("to"), header_data.get("reply_to"), header_data.get("return_path")]
+    email_addresses = [value for value in email_addresses if value]
+    ioc_inventory = f"<b>URLs:</b> {safe(', '.join(ioc_data.get('urls', [])) or 'None')}<br><b>Domains:</b> {safe(', '.join(ioc_data.get('domains', [])) or 'None')}<br><b>Observed IPs:</b> {safe(', '.join(ioc_data.get('ips', [])) or 'None')}<br><b>Email fields:</b> {safe(' | '.join(email_addresses) or 'None')}<br><b>Attachment SHA-256:</b> {safe(', '.join(item.get('sha256', '') for item in ioc_data.get('attachments', [])) or 'None')}"
+    module_rows = "".join((
+        "<tr><td>Evidence ingestion and SHA-256 preservation</td><td>Complete</td><td>Source file, analysis time and evidence hash recorded; raw email is not retained by default.</td></tr>",
+        "<tr><td>MIME, header, identity and routing analysis</td><td>Complete</td><td>Parsed fields, MIME attachment metadata and Received headers are included in this report.</td></tr>",
+        "<tr><td>SPF / DKIM / DMARC</td><td>Header evidence + live DNS policy lookup</td><td>Receiver-reported outcomes and public sender-domain policy records are shown above.</td></tr>",
+        "<tr><td>Domain, URL, BEC and impersonation analysis</td><td>Complete for observable signals</td><td>Only detected signals are scored; absence of a signal is not proof of safety.</td></tr>",
+        "<tr><td>IP / GeoIP infrastructure context</td><td>Complete where public IPs are observed</td><td>Each result identifies its network-location provider and routing confidence.</td></tr>",
+        f"<tr><td>Explainable ML</td><td>{safe(ml.get('model', 'Unavailable'))}</td><td>Local text triage is displayed with feature influence and is never the sole final verdict.</td></tr>",
+        "<tr><td>External reputation / malware scanning</td><td>Not run unless explicitly configured</td><td>No VirusTotal, AbuseIPDB, URLhaus or ClamAV result is claimed in this report.</td></tr>",
+        "<tr><td>Blockchain anchoring</td><td>Optional analyst action</td><td>Only the evidence hash can be anchored after case review; raw mail is never put on-chain.</td></tr>",
+    ))
+    limitations = "<br>".join(safe(item) for item in result.get("limitations", [])) or "None recorded."
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>CIPHER-X Forensic Report</title><style>body{{font:15px Arial;margin:38px;color:#15243a;line-height:1.45}}h1{{color:#0f766e;margin-bottom:2px}}h2{{margin-top:28px;color:#0f5265}}table{{border-collapse:collapse;width:100%;margin:8px 0 16px}}td,th{{border:1px solid #cbd5e1;padding:8px;text-align:left;vertical-align:top}}th{{background:#edf7f7}}.score{{font-size:32px;color:#b91c1c;font-weight:bold}}.note{{border-left:4px solid #e09c22;padding:10px;background:#fff8e7}}.meta{{color:#526477}}.status{{font-weight:bold;color:#0f766e}}</style></head><body><h1>CIPHER-X Final Mail Investigation Report</h1><p class='meta'>Evidence-oriented email triage report — every module records a finding, evidence source, or explicit unavailable status.</p><p><b>Investigation:</b> {safe(result.get('investigation_id'))}<br><b>Evidence SHA-256:</b> {safe(result.get('evidence_sha256'))}<br><b>Generated:</b> {safe(result.get('analyzed_at'))}<br><b>Ingestion:</b> {safe(result.get('ingestion_source', 'authorized_mailbox'))}<br><b>Source file:</b> {safe(result.get('file'))}</p><p class='score'>{safe(result.get('risk_score'))}/100 — {safe(result.get('risk_level'))}</p><h2>1. Evidence preservation and message headers</h2><p><span class='status'>Preserved evidence metadata:</span> SHA-256 is recorded before analysis. The local case index stores the result and chain-of-custody entry; it does not retain raw email by default.</p><table><tr><th>Header / field</th><th>Observed value</th></tr>{header_rows}</table><h2>2. Header forensics and authentication</h2><table><tr><th>Mechanism</th><th>Receiver-reported result</th></tr>{auth_rows}</table><p>Live public DNS sender-policy lookup:</p><table><tr><th>Field</th><th>Observed value</th></tr>{policy_rows}</table><table><tr><th>Identity check</th><th>Finding</th></tr>{protocol_rows}</table><h2>3. Relay path and network-origin context</h2><table><tr><th>Received position</th><th>Raw relay evidence</th></tr>{received_rows}</table><table><tr><th>IP</th><th>Routing role</th><th>Network country</th><th>Service city / region</th><th>ASN / operator</th></tr>{infra_rows}</table><p class='note'>Received headers can be incomplete or forged. GeoIP is approximate network-infrastructure context; it does not establish a person's or organisation's physical location.</p><h2>4. Domain, URL, attachment and IOC inventory</h2><table><tr><th>Domain</th><th>Configured lookalike / TLD findings</th></tr>{domain_rows}</table><table><tr><th>Name</th><th>Declared type</th><th>Bytes</th><th>SHA-256</th></tr>{attachment_rows}</table><p>{ioc_inventory}</p><h2>5. Behavioural fraud and BEC analysis</h2><table><tr><th>Pattern</th><th>Points</th><th>Evidence-based interpretation</th></tr>{behavior_rows}</table><h2>6. Explainable AI evidence</h2><p><b>Model:</b> {safe(ml.get('model'))}<br><b>Phishing-language probability:</b> {safe(ml.get('phishing_probability'))}<br><b>Label:</b> {safe(ml.get('label'))}<br><b>Model limitation:</b> {safe(ml.get('limitations'))}</p><table><tr><th>Extracted text feature</th><th>Relative influence</th><th>Interpretation</th></tr>{cue_rows}</table><h2>7. Evidence-fusion risk assessment</h2><table><tr><th>Finding</th><th>Points</th><th>Explanation</th></tr>{rows}</table><p class='note'>The final risk score is a transparent sum of shown forensic evidence. The ML probability alone never creates a high-risk verdict.</p><h2>8. Module execution ledger</h2><table><tr><th>Module</th><th>Status</th><th>What this report proves</th></tr>{module_rows}</table><h2>9. Limitations and analyst hand-off</h2><p>{limitations}</p><p class='note'>This report supports triage, forensic preservation and investigator hand-off. It is not conclusive attribution; verify material findings with mail-server logs, approved reputation services and a qualified analyst.</p><script>print()</script></body></html>"""
+
+
+@app.get("/api/investigations/{case_id}/report")
+def saved_case_report(case_id: str):
+    result = get_case(case_id)
+    if not result:
+        raise HTTPException(404, "Investigation not found.")
+    return HTMLResponse(report_page(result), headers={"Content-Disposition": f"inline; filename={case_id}-forensic-report.html"})
+
+
+@app.get("/api/investigations/{case_id}/report/download")
+def download_saved_case_report(case_id: str):
+    """Download a locally generated forensic report without reopening the dashboard."""
+    result = get_case(case_id)
+    if not result:
+        raise HTTPException(404, "Investigation not found.")
+    return HTMLResponse(report_page(result), headers={"Content-Disposition": f'attachment; filename="{case_id}-forensic-report.html"'})
+
+
 @app.post("/api/report/html")
 async def report(file: UploadFile = File(...)):
-    raw = await file.read(); result = analyze(raw, file.filename or "email.eml")
-    rows = "".join(f"<tr><td>{html.escape(e['title'])}</td><td>+{e['points']}</td><td>{html.escape(e['detail'])}</td></tr>" for e in result['evidence'])
-    iocs = "<br>".join(html.escape(x) for x in result['iocs']['urls'] + result['iocs']['domains'] + result['iocs']['ips']) or "None"
-    infra_rows = "".join(f"<tr><td>{html.escape(i['ip'])}</td><td>{html.escape(i['role'])}</td><td>{html.escape(i['country'])}</td><td>{html.escape(i['city'])}, {html.escape(i['region'])}</td><td>{html.escape(i['asn'])} / {html.escape(i['isp'])}</td></tr>" for i in result["infrastructure"]) or "<tr><td colspan='5'>No public routing IP was observed.</td></tr>"
-    page = f"""<!doctype html><title>CIPHER-X Forensic Report</title><style>body{{font:14px Arial;margin:40px;color:#16213e}}h1{{color:#0f766e}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:8px;text-align:left}}.score{{font-size:42px;color:#b91c1c}}.note{{border-left:4px solid #e09c22;padding:10px;background:#fff8e7}}</style><h1>CIPHER-X Forensic Investigation Report</h1><p><b>Investigation:</b> {result['investigation_id']}<br><b>Evidence SHA-256:</b> {result['evidence_sha256']}<br><b>Generated:</b> {result['analyzed_at']}</p><p class='score'>{result['risk_score']}/100 — {result['risk_level']}</p><h2>Email</h2><p><b>From:</b> {html.escape(result['email']['from'])}<br><b>Subject:</b> {html.escape(result['email']['subject'])}</p><h2>Authentication evidence</h2><p>{html.escape(str(result['authentication']))}</p><h2>Risk evidence</h2><table><tr><th>Finding</th><th>Points</th><th>Explanation</th></tr>{rows}</table><h2>Observed mail infrastructure</h2><table><tr><th>IP</th><th>Routing role</th><th>Network country</th><th>Service city / region</th><th>ASN / operator</th></tr>{infra_rows}</table><p class='note'>GeoIP indicates approximate mail or network infrastructure. It does not identify the physical location of the organisation in the From address, an attacker, or a person.</p><h2>Indicators of compromise</h2><p>{iocs}</p><h2>Limitations</h2><p>{'<br>'.join(html.escape(x) for x in result['limitations'])}</p><script>print()</script>"""
-    return HTMLResponse(page, headers={"Content-Disposition": "inline; filename=forensic-report.html"})
+    raw = await file.read()
+    return HTMLResponse(report_page(analyze(raw, file.filename or "email.eml")), headers={"Content-Disposition": "inline; filename=forensic-report.html"})
