@@ -1,11 +1,11 @@
-"""Read-only OAuth connectors for Outlook/Microsoft 365 and Yahoo Mail.
+"""Read-only OAuth connector for Outlook/Microsoft 365.
 
 Provider credentials stay in environment variables. Tokens are temporary,
 in-memory prototype state and are never returned through the API.
 """
 from __future__ import annotations
 
-import base64, hashlib, imaplib, json, os, secrets, threading, uuid
+import base64, hashlib, json, os, secrets, threading, uuid
 from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import urlencode
@@ -17,11 +17,6 @@ PROVIDERS = {
         "authorize": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
         "token": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
         "scopes": ["openid", "profile", "email", "offline_access", "https://graph.microsoft.com/User.Read", "https://graph.microsoft.com/Mail.Read"],
-    },
-    "yahoo": {
-        "label": "Yahoo Mail", "prefix": "CIPHERX_YAHOO",
-        "authorize": "https://api.login.yahoo.com/oauth2/request_auth",
-        "token": "https://api.login.yahoo.com/oauth2/get_token", "scopes": ["openid", "mail-r"],
     },
 }
 _connections: dict[str, dict] = {}
@@ -64,8 +59,8 @@ def complete_authorization(provider: str, code: str, verifier: str) -> str:
     token_data = _json(PROVIDERS[provider]["token"], form=form)
     token = token_data.get("access_token")
     if not token: raise RuntimeError("The provider did not return an access token.")
-    if provider == "outlook": profile = _json("https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName", token); email = profile.get("mail") or profile.get("userPrincipalName")
-    else: profile = _json("https://api.login.yahoo.com/openid/v1/userinfo", token); email = profile.get("email") or profile.get("preferred_username")
+    profile = _json("https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName", token)
+    email = profile.get("mail") or profile.get("userPrincipalName")
     connection_id = uuid.uuid4().hex
     with _lock:
         _connections[connection_id] = {"provider": provider, "email": email or f"Authorized {PROVIDERS[provider]['label']} account", "token": token, "scanner": {"running": False, "processed": 0, "requested": 0, "failed": 0, "sources": [], "last_error": None, "finished_at": None}}
@@ -106,28 +101,9 @@ def _outlook_messages(record: dict, limit: int):
             request = Request(f"https://graph.microsoft.com/v1.0/me/messages/{message['id']}/$value", headers={"Authorization": f"Bearer {token}", "Accept": "message/rfc822"})
             with urlopen(request, timeout=25) as response: yield source, f"outlook-{message['id']}.eml", response.read()
 
-def _yahoo_messages(record: dict, limit: int):
-    mail = imaplib.IMAP4_SSL("imap.mail.yahoo.com", 993)
-    try:
-        auth = f"user={record['email']}\x01auth=Bearer {record['token']}\x01\x01".encode()
-        mail.authenticate("XOAUTH2", lambda _: auth)
-        status, boxes = mail.list()
-        names = b" ".join(boxes or []).decode(errors="ignore")
-        spam = "Bulk Mail" if "Bulk Mail" in names else "Spam"
-        for source, folder in (("yahoo_unread_inbox", "INBOX"), ("yahoo_spam", spam)):
-            if mail.select(f'"{folder}"', readonly=True)[0] != "OK": continue
-            _, values = mail.search(None, "UNSEEN")
-            for message_id in (values[0].split()[-limit:] if values and values[0] else []):
-                _, payload = mail.fetch(message_id, "(RFC822)")
-                raw = next((part[1] for part in payload if isinstance(part, tuple) and isinstance(part[1], bytes)), b"")
-                if raw: yield source, f"yahoo-{message_id.decode()}.eml", raw
-    finally:
-        try: mail.logout()
-        except Exception: pass
-
 def _scan(provider: str, connection_id: str, limit: int, analyze: Callable[[bytes, str], dict], persist: Callable[[dict], object]) -> None:
     try:
-        record = _record(connection_id); iterator = _outlook_messages(record, limit) if provider == "outlook" else _yahoo_messages(record, limit)
+        iterator = _outlook_messages(_record(connection_id), limit)
         for source, filename, raw in iterator:
             with _lock: _connections[connection_id]["scanner"]["requested"] += 1
             try:

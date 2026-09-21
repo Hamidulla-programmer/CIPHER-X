@@ -19,9 +19,6 @@ CIPHERX_GOOGLE_REDIRECT_URI=https://cipher-x-1.onrender.com/api/gmail/oauth/call
 CIPHERX_MICROSOFT_CLIENT_ID=<Microsoft Entra client ID>
 CIPHERX_MICROSOFT_CLIENT_SECRET=<Microsoft Entra client secret>
 CIPHERX_MICROSOFT_REDIRECT_URI=https://cipher-x-1.onrender.com/api/mail/oauth/outlook/callback
-CIPHERX_YAHOO_CLIENT_ID=<Yahoo consumer key>
-CIPHERX_YAHOO_CLIENT_SECRET=<Yahoo consumer secret>
-CIPHERX_YAHOO_REDIRECT_URI=https://cipher-x-1.onrender.com/api/mail/oauth/yahoo/callback
 ```
 
 Do not set `PORT`. Render provides it automatically. Do not add any of the above secrets to Netlify or GitHub.
@@ -34,7 +31,6 @@ Add the exact matching public callback to each registered OAuth application:
 |---|---|
 | Google Gmail | `https://cipher-x-1.onrender.com/api/gmail/oauth/callback` |
 | Outlook / Microsoft 365 | `https://cipher-x-1.onrender.com/api/mail/oauth/outlook/callback` |
-| Yahoo Mail | `https://cipher-x-1.onrender.com/api/mail/oauth/yahoo/callback` |
 
 ## Deployment order
 
