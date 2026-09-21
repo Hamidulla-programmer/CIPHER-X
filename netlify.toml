@@ -10,3 +10,8 @@ publish = "static"
 from = "/static/*"
 to = "/:splat"
 status = 200
+
+[[headers]]
+for = "/static/*.jsx"
+  [headers.values]
+  Content-Type = "application/javascript; charset=UTF-8"
