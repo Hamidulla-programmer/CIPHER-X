@@ -1,5 +1,12 @@
 [build]
-  publish = "static"
+publish = "static"
 
 # CIPHER-X's FastAPI investigation service is not a static Netlify build.
 # This configuration deploys the dashboard assets only.
+
+# FastAPI serves assets at /static/* locally. Netlify publishes this folder
+# at the site root, so rewrite those same asset requests for the public UI.
+[[redirects]]
+from = "/static/*"
+to = "/:splat"
+status = 200
