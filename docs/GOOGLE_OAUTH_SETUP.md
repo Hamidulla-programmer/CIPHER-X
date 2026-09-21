@@ -16,7 +16,8 @@ Gmail password or App Password.
 
    `http://127.0.0.1:8000/api/gmail/oauth/callback`
 
-For deployment, add the exact backend URL instead, for example:
+For the deployed CIPHER-X service, use the exact public callback below. The
+complete Render/Netlify configuration is in `docs/PRODUCTION_DEPLOYMENT.md`.
 
    `https://your-fastapi-service.example/api/gmail/oauth/callback`
 
@@ -26,9 +27,9 @@ For deployment, add the exact backend URL instead, for example:
    ```text
    CIPHERX_GOOGLE_CLIENT_ID=...
    CIPHERX_GOOGLE_CLIENT_SECRET=...
-   CIPHERX_GOOGLE_REDIRECT_URI=http://127.0.0.1:8000/api/gmail/oauth/callback
+   CIPHERX_GOOGLE_REDIRECT_URI=https://cipher-x-1.onrender.com/api/gmail/oauth/callback
    CIPHERX_SESSION_SECRET=replace-with-a-long-random-value
-   CIPHERX_FRONTEND_URL=https://your-netlify-site.netlify.app
+   CIPHERX_FRONTEND_URL=https://cipher-x-main.netlify.app
    ```
 
 6. Install the updated requirements and start the backend:
