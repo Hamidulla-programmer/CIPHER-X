@@ -1,5 +1,8 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 python-multipart==0.0.20
-scikit-learn>=1.9.1
+scikit-learn>=1.5,<2
 web3>=7.0.0
+google-auth-oauthlib>=1.2.1
+itsdangerous>=2.2.0
+python-dotenv>=1.0.1

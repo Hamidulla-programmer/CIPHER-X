@@ -7,19 +7,23 @@ import ipaddress
 import re
 import uuid
 import os
+import logging
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request as URLRequest, urlopen
 from urllib.error import URLError
 from functools import lru_cache
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+from dotenv import load_dotenv
 from .realtime_monitor import ImapMonitor
 from .mailbox_scanner import MailboxScanner
 from .mailbox_store import save as save_case, dashboard as mailbox_dashboard
@@ -28,10 +32,20 @@ from .forensics import protocol_evidence, domain_intelligence, behavioral_eviden
 from .live_intelligence import authentication_intelligence
 from .blockchain import status as blockchain_status, anchor as anchor_evidence, verify as verify_anchor
 from .mailbox_store import case_hash, save_anchor, get_case, intelligence, clear_cases
+from . import google_oauth
+from . import external_mail_oauth
 
 ROOT = Path(__file__).resolve().parent.parent
+# Local development reads private configuration from .env.  Deployed hosts
+# provide the same names as protected environment variables; those always win.
+load_dotenv(ROOT / ".env", override=False)
 ORGANIZATION_PROFILES = json.loads((ROOT / "data" / "organization_profiles.json").read_text(encoding="utf-8"))
 app = FastAPI(title="CIPHER-X", version="1.0.0")
+logger = logging.getLogger("cipherx.oauth")
+frontend_url = os.getenv("CIPHERX_FRONTEND_URL", "").rstrip("/")
+external_frontend = bool(frontend_url and frontend_url not in {"http://127.0.0.1:8000", "http://localhost:8000"})
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("CIPHERX_SESSION_SECRET", "cipherx-local-prototype-change-this"), https_only=external_frontend or os.getenv("CIPHERX_COOKIE_SECURE", "false").lower() == "true", same_site="none" if external_frontend else "lax")
+app.add_middleware(CORSMiddleware, allow_origins=[origin for origin in {frontend_url, "http://127.0.0.1:8000", "http://localhost:8000"} if origin], allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
@@ -146,7 +160,7 @@ def enrich_ip(ip: str) -> dict:
     if not public_ip(ip):
         return {"ip": ip, "scope": "private/reserved", "country": "Not applicable", "region": "Not applicable", "city": "Not applicable", "latitude": None, "longitude": None, "asn": "N/A", "isp": "Not applicable", "organization": "Not applicable", "timezone": "N/A", "confidence": "high", "source": "RFC 1918 / reserved-address classification", "lookup_status": "not_applicable", "looked_up_at": datetime.now(timezone.utc).isoformat()}
     try:
-        request = Request(f"https://ipwho.is/{ip}", headers={"User-Agent": "CIPHER-X-SIH-MVP/1.0", "Accept": "application/json"})
+        request = URLRequest(f"https://ipwho.is/{ip}", headers={"User-Agent": "CIPHER-X-SIH-MVP/1.0", "Accept": "application/json"})
         with urlopen(request, timeout=4) as response:
             payload = json.loads(response.read().decode("utf-8"))
         if not payload.get("success", True):
@@ -358,9 +372,136 @@ def stop_monitor():
     return monitor.status()
 
 
+def gmail_connection_status(request: Request) -> dict:
+    """Return browser-session OAuth state without exposing any token material."""
+    result = google_oauth.status(request.session.get("gmail_connection_id"))
+    result["last_error"] = request.session.get("gmail_oauth_error")
+    return result
+
+
 @app.get("/api/mailbox/dashboard")
-def get_mailbox_dashboard():
-    return {"scanner": mailbox_scanner.status(), "monitor": monitor.status(), "ml": model_status(), "dashboard": mailbox_dashboard()}
+def get_mailbox_dashboard(request: Request):
+    providers = {name: external_mail_oauth.status(name, request.session.get(f"{name}_connection_id")) for name in external_mail_oauth.PROVIDERS}
+    return {"scanner": mailbox_scanner.status(), "google": gmail_connection_status(request), "providers": providers, "monitor": monitor.status(), "ml": model_status(), "dashboard": mailbox_dashboard()}
+
+
+@app.get("/api/gmail/oauth/status")
+def gmail_oauth_status(request: Request):
+    return gmail_connection_status(request)
+
+
+@app.get("/api/gmail/oauth/start")
+def gmail_oauth_start(request: Request):
+    try:
+        url, state, code_verifier = google_oauth.authorization_url()
+        request.session.pop("gmail_oauth_error", None)
+        request.session["gmail_oauth_state"] = state
+        request.session["gmail_oauth_code_verifier"] = code_verifier
+        return RedirectResponse(url)
+    except RuntimeError as error:
+        raise HTTPException(503, str(error))
+
+
+@app.get("/api/gmail/oauth/callback")
+def gmail_oauth_callback(request: Request, state: str = "", code: str = "", error: str = ""):
+    # A local installation normally has no CIPHERX_FRONTEND_URL.  Do not build
+    # URLs as "//?…" in that case: browsers treat that as a scheme-relative
+    # URL and may send the OAuth callback into a redirect loop.
+    configured_frontend = os.getenv("CIPHERX_FRONTEND_URL", "").strip().rstrip("/")
+    frontend_url = configured_frontend or ""
+    def dashboard_redirect(query: str) -> RedirectResponse:
+        destination = f"{frontend_url}/?{query}" if frontend_url else f"/?{query}"
+        return RedirectResponse(destination, status_code=303)
+    if error:
+        logger.warning("Google OAuth returned error: %s", error)
+        request.session["gmail_oauth_error"] = f"Google declined authorization: {error}. Confirm that this Gmail address is listed as a Google Cloud test user."
+        return dashboard_redirect(f"gmail_error={error}")
+    if not code or state != request.session.get("gmail_oauth_state"):
+        logger.warning("Google OAuth state validation failed.")
+        request.session["gmail_oauth_error"] = "The secure Google login session did not match this browser. Start the Gmail connection again from the CIPHER-X dashboard."
+        return dashboard_redirect("gmail_error=invalid_oauth_state")
+    try:
+        request.session["gmail_connection_id"] = google_oauth.complete_authorization(code, request.session.get("gmail_oauth_code_verifier", ""))
+        request.session.pop("gmail_oauth_state", None)
+        request.session.pop("gmail_oauth_code_verifier", None)
+        request.session.pop("gmail_oauth_error", None)
+        return dashboard_redirect("gmail_connected=1")
+    except Exception as exc:
+        logger.exception("Google OAuth token exchange failed")
+        request.session["gmail_oauth_error"] = "Google approved access, but CIPHER-X could not complete the secure token exchange. See the server terminal for the exact technical error, then reconnect."
+        return dashboard_redirect("gmail_error=authorization_failed")
+
+
+@app.post("/api/gmail/oauth/disconnect")
+def gmail_oauth_disconnect(request: Request):
+    google_oauth.disconnect(request.session.get("gmail_connection_id"))
+    request.session.pop("gmail_connection_id", None)
+    request.session.pop("gmail_oauth_error", None)
+    return {"connected": False, "message": "Gmail access was disconnected for this browser session."}
+
+
+@app.post("/api/gmail/oauth/scan")
+def gmail_oauth_scan(request: Request, limit: int = 250):
+    try:
+        return google_oauth.start_scan(request.session.get("gmail_connection_id", ""), limit, analyze, save_case)
+    except RuntimeError as error:
+        raise HTTPException(400, str(error))
+
+
+@app.post("/api/gmail/oauth/watch/start")
+def gmail_oauth_watch_start(request: Request, poll_seconds: int = 60):
+    try:
+        return google_oauth.start_watch(request.session.get("gmail_connection_id", ""), poll_seconds, analyze, save_case)
+    except RuntimeError as error:
+        raise HTTPException(400, str(error))
+
+
+@app.post("/api/gmail/oauth/watch/stop")
+def gmail_oauth_watch_stop(request: Request):
+    try:
+        return google_oauth.stop_watch(request.session.get("gmail_connection_id", ""))
+    except RuntimeError as error:
+        raise HTTPException(400, str(error))
+
+
+@app.get("/api/mail/oauth/{provider}/start")
+def external_oauth_start(provider: str, request: Request):
+    try:
+        url, state, verifier = external_mail_oauth.authorization_url(provider)
+        request.session[f"{provider}_oauth_state"] = state
+        request.session[f"{provider}_oauth_verifier"] = verifier
+        return RedirectResponse(url)
+    except (RuntimeError, KeyError) as error:
+        raise HTTPException(503, str(error))
+
+
+@app.get("/api/mail/oauth/{provider}/callback")
+def external_oauth_callback(provider: str, request: Request, state: str = "", code: str = "", error: str = ""):
+    configured_frontend = os.getenv("CIPHERX_FRONTEND_URL", "").strip().rstrip("/")
+    def redirect(query: str): return RedirectResponse(f"{configured_frontend}/?{query}" if configured_frontend else f"/?{query}", status_code=303)
+    if error or not code or state != request.session.get(f"{provider}_oauth_state"):
+        return redirect(f"mail_error={provider}")
+    try:
+        request.session[f"{provider}_connection_id"] = external_mail_oauth.complete_authorization(provider, code, request.session.get(f"{provider}_oauth_verifier", ""))
+        request.session.pop(f"{provider}_oauth_state", None); request.session.pop(f"{provider}_oauth_verifier", None)
+        return redirect(f"mail_connected={provider}")
+    except Exception:
+        logger.exception("%s OAuth token exchange failed", provider)
+        return redirect(f"mail_error={provider}")
+
+
+@app.post("/api/mail/oauth/{provider}/scan")
+def external_oauth_scan(provider: str, request: Request, limit: int = 250):
+    try: return external_mail_oauth.start_scan(provider, request.session.get(f"{provider}_connection_id", ""), limit, analyze, save_case)
+    except (RuntimeError, KeyError) as error: raise HTTPException(400, str(error))
+
+
+@app.post("/api/mail/oauth/{provider}/disconnect")
+def external_oauth_disconnect(provider: str, request: Request):
+    try:
+        external_mail_oauth.disconnect(provider, request.session.get(f"{provider}_connection_id")); request.session.pop(f"{provider}_connection_id", None)
+        return {"connected": False}
+    except KeyError: raise HTTPException(404, "Unsupported mail provider.")
 
 
 @app.get("/api/investigations")
