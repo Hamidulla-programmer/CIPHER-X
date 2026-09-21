@@ -397,6 +397,7 @@ def gmail_oauth_start(request: Request):
         request.session.pop("gmail_oauth_error", None)
         request.session["gmail_oauth_state"] = state
         request.session["gmail_oauth_code_verifier"] = code_verifier
+        google_oauth.remember_authorization(state, code_verifier)
         return RedirectResponse(url)
     except RuntimeError as error:
         raise HTTPException(503, str(error))
@@ -416,12 +417,15 @@ def gmail_oauth_callback(request: Request, state: str = "", code: str = "", erro
         logger.warning("Google OAuth returned error: %s", error)
         request.session["gmail_oauth_error"] = f"Google declined authorization: {error}. Confirm that this Gmail address is listed as a Google Cloud test user."
         return dashboard_redirect(f"gmail_error={error}")
-    if not code or state != request.session.get("gmail_oauth_state"):
+    session_state = request.session.get("gmail_oauth_state")
+    session_verifier = request.session.get("gmail_oauth_code_verifier", "")
+    pending_verifier = google_oauth.take_pending_authorization(state) if code and state else None
+    if not code or (state != session_state and not pending_verifier):
         logger.warning("Google OAuth state validation failed.")
         request.session["gmail_oauth_error"] = "The secure Google login session did not match this browser. Start the Gmail connection again from the CIPHER-X dashboard."
         return dashboard_redirect("gmail_error=invalid_oauth_state")
     try:
-        request.session["gmail_connection_id"] = google_oauth.complete_authorization(code, request.session.get("gmail_oauth_code_verifier", ""))
+        request.session["gmail_connection_id"] = google_oauth.complete_authorization(code, session_verifier or pending_verifier or "")
         request.session.pop("gmail_oauth_state", None)
         request.session.pop("gmail_oauth_code_verifier", None)
         request.session.pop("gmail_oauth_error", None)

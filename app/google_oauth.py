@@ -10,7 +10,7 @@ import base64
 import os
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -24,6 +24,7 @@ from google_auth_oauthlib.flow import Flow
 # as a changed scope.
 SCOPES = ["openid", "https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/userinfo.email"]
 _connections: dict[str, dict] = {}
+_pending_authorizations: dict[str, dict] = {}
 _lock = threading.Lock()
 
 
@@ -46,6 +47,29 @@ def authorization_url() -> tuple[str, str, str]:
     if not flow.code_verifier:
         raise RuntimeError("Google OAuth could not create a PKCE code verifier.")
     return url, state, flow.code_verifier
+
+
+def remember_authorization(state: str, code_verifier: str) -> None:
+    """Keep a short-lived PKCE verifier server-side as a cookie-safe fallback.
+
+    The browser session remains the primary CSRF binding. This record handles
+    restrictive cross-site-cookie settings during the Google → Render callback.
+    It expires after ten minutes and is consumed exactly once.
+    """
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    with _lock:
+        now = datetime.now(timezone.utc)
+        for key in [key for key, value in _pending_authorizations.items() if value["expires_at"] <= now]:
+            _pending_authorizations.pop(key, None)
+        _pending_authorizations[state] = {"code_verifier": code_verifier, "expires_at": expires_at}
+
+
+def take_pending_authorization(state: str) -> str | None:
+    with _lock:
+        value = _pending_authorizations.pop(state, None)
+    if not value or value["expires_at"] <= datetime.now(timezone.utc):
+        return None
+    return value["code_verifier"]
 
 
 def complete_authorization(code: str, code_verifier: str) -> str:
