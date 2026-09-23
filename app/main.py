@@ -296,6 +296,19 @@ def analyze_and_store(raw: bytes, filename: str, ingestion_source: str = "author
     return result
 
 
+def investigation_scope(request: Request) -> str:
+    """Return the isolated evidence workspace for this browser session.
+
+    Case records are never shared between public dashboard visitors. The scope
+    is an opaque random ID stored only in the signed server session cookie.
+    """
+    scope = request.session.get("investigation_scope")
+    if not scope:
+        scope = uuid.uuid4().hex
+        request.session["investigation_scope"] = scope
+    return scope
+
+
 monitor = ImapMonitor(analyze_and_store)
 mailbox_scanner = MailboxScanner(analyze, save_case)
 
@@ -306,14 +319,17 @@ def home():
 
 
 @app.post("/api/analyze")
-async def upload(file: UploadFile = File(...)):
+async def upload(request: Request, file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".eml"):
         raise HTTPException(400, "Upload an RFC 822 .eml file.")
     raw = await file.read()
     if len(raw) > 10 * 1024 * 1024:
         raise HTTPException(413, "Maximum upload size is 10 MB.")
     try:
-        return JSONResponse(analyze_and_store(raw, file.filename, "eml_upload"))
+        result = analyze(raw, file.filename)
+        result["ingestion_source"] = "eml_upload"
+        save_case(result, investigation_scope(request))
+        return JSONResponse(result)
     except Exception as exc:
         raise HTTPException(422, f"Could not parse email: {exc}")
 
@@ -324,25 +340,28 @@ class PasteEmail(BaseModel):
 
 
 @app.post("/api/analyze/paste")
-def analyze_pasted_email(request: PasteEmail):
-    if not request.content.strip():
+def analyze_pasted_email(payload: PasteEmail, request: Request):
+    if not payload.content.strip():
         raise HTTPException(400, "Paste an email message or RFC 822 headers before analysis.")
-    raw = request.content.encode("utf-8", errors="replace")
+    raw = payload.content.encode("utf-8", errors="replace")
     try:
-        return JSONResponse(analyze_and_store(raw, request.filename, "pasted_message"))
+        result = analyze(raw, payload.filename)
+        result["ingestion_source"] = "pasted_message"
+        save_case(result, investigation_scope(request))
+        return JSONResponse(result)
     except Exception as exc:
         raise HTTPException(422, f"Could not parse pasted email: {exc}")
 
 
 @app.post("/api/demo/phishing")
-def run_phishing_demo():
+def run_phishing_demo(request: Request):
     """Analyze the bundled, clearly labelled test message for demonstrations."""
     sample = ROOT / "samples" / "phishing-demo.eml"
     if not sample.exists():
         raise HTTPException(404, "The bundled phishing demonstration file is unavailable.")
     result = analyze(sample.read_bytes(), sample.name)
     result["ingestion_source"] = "bundled_test_file"
-    save_case(result)
+    save_case(result, investigation_scope(request))
     return JSONResponse(result)
 
 
@@ -382,7 +401,7 @@ def gmail_connection_status(request: Request) -> dict:
 @app.get("/api/mailbox/dashboard")
 def get_mailbox_dashboard(request: Request):
     providers = {name: external_mail_oauth.status(name, request.session.get(f"{name}_connection_id")) for name in external_mail_oauth.PROVIDERS}
-    return {"scanner": mailbox_scanner.status(), "google": gmail_connection_status(request), "providers": providers, "monitor": monitor.status(), "ml": model_status(), "dashboard": mailbox_dashboard()}
+    return {"scanner": mailbox_scanner.status(), "google": gmail_connection_status(request), "providers": providers, "monitor": monitor.status(), "ml": model_status(), "dashboard": mailbox_dashboard(investigation_scope(request))}
 
 
 @app.get("/api/gmail/oauth/status")
@@ -447,7 +466,8 @@ def gmail_oauth_disconnect(request: Request):
 @app.post("/api/gmail/oauth/scan")
 def gmail_oauth_scan(request: Request, limit: int = 250):
     try:
-        return google_oauth.start_scan(request.session.get("gmail_connection_id", ""), limit, analyze, save_case)
+        scope = investigation_scope(request)
+        return google_oauth.start_scan(request.session.get("gmail_connection_id", ""), limit, analyze, lambda result: save_case(result, scope))
     except RuntimeError as error:
         raise HTTPException(400, str(error))
 
@@ -455,7 +475,8 @@ def gmail_oauth_scan(request: Request, limit: int = 250):
 @app.post("/api/gmail/oauth/watch/start")
 def gmail_oauth_watch_start(request: Request, poll_seconds: int = 60):
     try:
-        return google_oauth.start_watch(request.session.get("gmail_connection_id", ""), poll_seconds, analyze, save_case)
+        scope = investigation_scope(request)
+        return google_oauth.start_watch(request.session.get("gmail_connection_id", ""), poll_seconds, analyze, lambda result: save_case(result, scope))
     except RuntimeError as error:
         raise HTTPException(400, str(error))
 
@@ -496,7 +517,9 @@ def external_oauth_callback(provider: str, request: Request, state: str = "", co
 
 @app.post("/api/mail/oauth/{provider}/scan")
 def external_oauth_scan(provider: str, request: Request, limit: int = 250):
-    try: return external_mail_oauth.start_scan(provider, request.session.get(f"{provider}_connection_id", ""), limit, analyze, save_case)
+    try:
+        scope = investigation_scope(request)
+        return external_mail_oauth.start_scan(provider, request.session.get(f"{provider}_connection_id", ""), limit, analyze, lambda result: save_case(result, scope))
     except (RuntimeError, KeyError) as error: raise HTTPException(400, str(error))
 
 
@@ -509,27 +532,27 @@ def external_oauth_disconnect(provider: str, request: Request):
 
 
 @app.get("/api/investigations")
-def investigations():
-    return mailbox_dashboard()
+def investigations(request: Request):
+    return mailbox_dashboard(investigation_scope(request))
 
 
 @app.post("/api/investigations/clear")
-def clear_investigations():
-    removed = clear_cases()
+def clear_investigations(request: Request):
+    removed = clear_cases(investigation_scope(request))
     return {"removed_cases": removed, "message": "Local CIPHER-X investigation data cleared. Gmail messages were not changed."}
 
 
 @app.get("/api/investigations/{case_id}")
-def investigation(case_id: str):
-    item = get_case(case_id)
+def investigation(case_id: str, request: Request):
+    item = get_case(case_id, investigation_scope(request))
     if not item:
         raise HTTPException(404, "Investigation not found.")
     return item
 
 
 @app.get("/api/intelligence")
-def threat_intelligence():
-    return intelligence()
+def threat_intelligence(request: Request):
+    return intelligence(investigation_scope(request))
 
 
 @app.get("/api/system/capabilities")
@@ -576,13 +599,14 @@ def get_blockchain_status():
 
 
 @app.post("/api/cases/{case_id}/anchor")
-def anchor_case(case_id: str):
-    evidence_hash = case_hash(case_id)
+def anchor_case(case_id: str, request: Request):
+    scope = investigation_scope(request)
+    evidence_hash = case_hash(case_id, scope)
     if not evidence_hash:
         raise HTTPException(404, "Case not found in the local evidence index.")
     try:
         anchored = anchor_evidence(case_id, evidence_hash)
-        save_anchor(anchored)
+        save_anchor(anchored, scope)
         return anchored
     except RuntimeError as error:
         raise HTTPException(400, str(error))
@@ -641,17 +665,17 @@ def report_page(result: dict) -> str:
 
 
 @app.get("/api/investigations/{case_id}/report")
-def saved_case_report(case_id: str):
-    result = get_case(case_id)
+def saved_case_report(case_id: str, request: Request):
+    result = get_case(case_id, investigation_scope(request))
     if not result:
         raise HTTPException(404, "Investigation not found.")
     return HTMLResponse(report_page(result), headers={"Content-Disposition": f"inline; filename={case_id}-forensic-report.html"})
 
 
 @app.get("/api/investigations/{case_id}/report/download")
-def download_saved_case_report(case_id: str):
+def download_saved_case_report(case_id: str, request: Request):
     """Download a locally generated forensic report without reopening the dashboard."""
-    result = get_case(case_id)
+    result = get_case(case_id, investigation_scope(request))
     if not result:
         raise HTTPException(404, "Investigation not found.")
     return HTMLResponse(report_page(result), headers={"Content-Disposition": f'attachment; filename="{case_id}-forensic-report.html"'})
